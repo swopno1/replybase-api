@@ -7,6 +7,16 @@ const { decrypt } = require("./utils/crypto");
 const app = express();
 app.use(express.json());
 
+// --- ADD THIS DEBUG MIDDLEWARE HERE ---
+app.use((req, res, next) => {
+  console.log(`[${req.method}] ${req.url}`);
+  if (req.method === 'POST') {
+    // Log the raw body so we see EXACTLY what Meta is sending
+    console.log('Incoming Payload:', JSON.stringify(req.body, null, 2));
+  }
+  next();
+});
+
 // Database Connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
