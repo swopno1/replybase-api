@@ -1,76 +1,99 @@
 require("dotenv").config();
 const express = require("express");
-const bodyParser = require("body-parser");
 const { Pool } = require("pg");
 const axios = require("axios");
-const { decrypt, encrypt } = require("./utils/crypto");
+const { decrypt } = require("./utils/crypto");
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.json());
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+// Database Connection
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl:
+    process.env.NODE_ENV === "production"
+      ? { rejectUnauthorized: false }
+      : false,
+});
 
-// 1. Meta Verification Endpoint (Required when you first connect the webhook)
+// --- ROUTE 1: Meta Verification (The Handshake) ---
 app.get("/webhooks/meta", (req, res) => {
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
 
+  // Check if the token matches what you set in .env
   if (mode && token === process.env.META_VERIFY_TOKEN) {
+    console.log("WEBHOOK_VERIFIED");
     res.status(200).send(challenge);
   } else {
     res.sendStatus(403);
   }
 });
 
-// 2. The Main Event Handler
+// --- ROUTE 2: Handle Incoming Messages ---
 app.post("/webhooks/meta", async (req, res) => {
   const body = req.body;
 
+  // 1. Check if this is a Page event
   if (body.object === "page") {
-    // Iterate over entries (Meta sends batched events)
+    // 2. Iterate over batched entries
     for (const entry of body.entry) {
-      const webhookEvent = entry.messaging[0];
-      const senderPsid = webhookEvent.sender.id;
-      const pageId = entry.id; // This identifies WHICH tenant
+      // Get the message details
+      const webhookEvent = entry.messaging ? entry.messaging[0] : null;
 
-      // A. Find the Tenant based on Page ID
-      const result = await pool.query(
-        "SELECT * FROM credentials WHERE page_id = $1 AND platform = $2",
-        [pageId, "facebook"]
-      );
+      if (webhookEvent && webhookEvent.message) {
+        const pageId = entry.id; // This is the ID of the Client's Facebook Page
+        const senderId = webhookEvent.sender.id;
+        const messageText = webhookEvent.message.text;
 
-      if (result.rows.length > 0) {
-        const creds = result.rows[0];
+        console.log(`Received message for Page ID: ${pageId}`);
 
-        // B. Decrypt the Token
-        const accessToken = decrypt({
-          iv: creds.encryption_iv,
-          encryptedData: creds.encrypted_token,
-        });
-
-        // C. Forward to n8n (Headless)
-        // We pass the message AND the decrypted token
         try {
-          await axios.post(process.env.N8N_WEBHOOK_URL, {
-            message: webhookEvent.message.text,
-            sender_id: senderPsid,
-            page_id: pageId,
-            tenant_id: creds.tenant_id,
-            credentials: {
-              access_token: accessToken, // Dynamic Credential for n8n
-            },
-          });
-          console.log(`Forwarded message for Tenant ${creds.tenant_id}`);
-        } catch (err) {
-          console.error("n8n Error:", err.message);
+          // 3. Lookup Tenant in DB based on Page ID
+          const query = `
+                        SELECT tenant_id, encrypted_token, encryption_iv 
+                        FROM credentials 
+                        WHERE page_id = $1 AND platform = 'facebook'
+                    `;
+          const result = await pool.query(query, [pageId]);
+
+          if (result.rows.length > 0) {
+            const creds = result.rows[0];
+
+            // 4. Decrypt the Access Token
+            const accessToken = decrypt({
+              iv: creds.encryption_iv,
+              encryptedData: creds.encrypted_token,
+            });
+
+            // 5. Forward to n8n (Headless)
+            // We send the message + the DECRYPTED token to n8n
+            await axios.post(process.env.N8N_WEBHOOK_URL, {
+              tenant_id: creds.tenant_id,
+              page_id: pageId,
+              sender_id: senderId,
+              message: messageText,
+              credentials: {
+                access_token: accessToken,
+              },
+            });
+
+            console.log(`-> Forwarded to n8n for Tenant: ${creds.tenant_id}`);
+          } else {
+            console.warn(`No tenant found for Page ID: ${pageId}`);
+          }
+        } catch (error) {
+          console.error("Error processing webhook:", error.message);
         }
       }
     }
+    // Return 200 OK immediately to Meta (otherwise they stop sending)
     res.status(200).send("EVENT_RECEIVED");
   } else {
     res.sendStatus(404);
   }
 });
 
-app.listen(3000, () => console.log("API running on port 3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Wrapper API running on port ${PORT}`));
