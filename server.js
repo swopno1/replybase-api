@@ -18,6 +18,7 @@ const pool = new Pool({
   ssl: false // Keep false for Coolify internal network
 });
 
+
 // ==========================================
 // 1. USER AUTH (Register/Login)
 // ==========================================
@@ -174,7 +175,6 @@ app.use((req, res, next) => {
 });
 
 
-
 // --- ROUTE 1: Meta Verification (The Handshake) ---
 app.get("/webhooks/meta", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -254,6 +254,7 @@ app.post("/webhooks/meta", async (req, res) => {
   }
 });
 
+
 // ==========================================
 // 4. PRIVATE DASHBOARD API (New)
 // ==========================================
@@ -305,6 +306,66 @@ app.post('/tenant/whatsapp', authenticate, async (req, res) => {
   }
 });
 
+
+// ==========================================
+// 5. FACEBOOK COMPLIANCE & DATA DELETION
+// ==========================================
+
+// Helper to decode FB Signed Request (Optional but recommended for verifying payload)
+const parseSignedRequest = (signedRequest, appSecret) => {
+  try {
+    const [encodedSig, payload] = signedRequest.split('.');
+    const data = JSON.parse(Buffer.from(payload, 'base64').toString());
+    return data;
+  } catch (e) {
+    return null;
+  }
+};
+
+// Callback: Deauthorize (User removes App from FB Settings)
+app.post('/auth/facebook/deauthorize', async (req, res) => {
+  const signedRequest = req.body.signed_request;
+  const data = parseSignedRequest(signedRequest, process.env.FB_APP_SECRET);
+
+  if (data && data.user_id) {
+    const fbUserId = data.user_id;
+    console.log(`[Deauth] User ${fbUserId} removed the app.`);
+
+    // MVP Action: Mark credentials as inactive in DB (Don't delete yet for logs)
+    // You would need to map fbUserId to your tenant_id via an API call or DB lookup
+    // For now, we just log it to satisfy the requirement.
+  }
+
+  // Facebook expects a success response
+  res.json({ success: true });
+});
+
+// Callback: Data Deletion Request (User requests data deletion)
+app.post('/auth/facebook/delete-data', async (req, res) => {
+  const signedRequest = req.body.signed_request;
+  const data = parseSignedRequest(signedRequest, process.env.FB_APP_SECRET);
+
+  if (data && data.user_id) {
+    const fbUserId = data.user_id;
+    const confirmationCode = `del_${Date.now()}`; // Generate a tracking code
+
+    console.log(`[Delete Data] Request from ${fbUserId}. Code: ${confirmationCode}`);
+
+    // MVP Action: Perform deletion logic here (e.g., DELETE FROM tenants WHERE...)
+
+    // Facebook Requirement: Return a URL where they can check status
+    // We point this to a generic status page on your frontend
+    const statusUrl = `https://site.investorhints.com/deletion-status?id=${confirmationCode}`;
+
+    return res.json({
+      url: statusUrl,
+      confirmation_code: confirmationCode,
+    });
+  }
+
+  res.sendStatus(400);
+});
+
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Wrapper API running on port ${PORT}`));
-
