@@ -20,10 +20,9 @@ app.use((req, res, next) => {
 // Database Connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false }
-      : false,
+  // Fix: Coolify internal Postgres usually does not support SSL. 
+  // Since this is a private internal network, we disable SSL.
+  ssl: false
 });
 
 // --- ROUTE 1: Meta Verification (The Handshake) ---
