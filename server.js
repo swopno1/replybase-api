@@ -52,105 +52,109 @@ app.post('/auth/login', async (req, res) => {
   res.json({ token, user: { id: user.id, email: user.email } });
 });
 
+
 // ==========================================
-// 2. FACEBOOK OAUTH (Fixed for Browser Redirect)
+// 2. UNIFIED FACEBOOK LOGIN & CONNECT
 // ==========================================
 
-// Step A: Generate the Login URL (Now includes 'state' for tenant_id)
-// Call this from Frontend: GET /auth/facebook/url?tenant_id=UUID
-app.get('/auth/facebook/url', (req, res) => {
-  const tenantId = req.query.tenant_id;
+// A. Initiate Login (Front-end links here)
+app.get('/auth/facebook/login', (req, res) => {
+  // We ask for email AND page permissions immediately
+  const scopes = 'email,public_profile,pages_messaging,pages_show_list,pages_manage_metadata,pages_read_engagement';
+  const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/facebook/callback_login`;
 
-  if (!tenantId) {
-    return res.status(400).json({ error: "Missing tenant_id" });
-  }
-
-  // We pass tenantId in the 'state' parameter. 
-  // Facebook returns this to us exactly as is.
-  const state = JSON.stringify({ tenant_id: tenantId });
-
-  const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.FB_APP_ID}&redirect_uri=${process.env.FB_REDIRECT_URI}&state=${state}&scope=pages_messaging,pages_show_list,pages_manage_metadata,pages_read_engagement`;
-
+  const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.FB_APP_ID}&redirect_uri=${redirectUri}&scope=${scopes}`;
   res.json({ url });
 });
 
-// Step B: Handle the Callback (Changed from POST to GET)
-app.get('/auth/facebook/callback', async (req, res) => {
-  // 1. Extract Data from Query Params (Browser Redirect)
-  const { code, state } = req.query;
+// B. Handle Login Callback
+app.get('/auth/facebook/callback_login', async (req, res) => {
+  const { code } = req.query;
+  const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/facebook/callback_login`;
 
-  if (!code || !state) {
-    return res.status(400).send("Login failed: Missing code or state from Facebook.");
-  }
+  if (!code) return res.status(400).send("No code received from Facebook");
 
   try {
-    // 2. Decode the 'state' to get the Tenant ID
-    const stateData = JSON.parse(state);
-    const tenant_id = stateData.tenant_id;
-
-    console.log(`Processing Facebook Connect for Tenant: ${tenant_id}`);
-
-    // 3. Exchange Code for Short-Lived User Token
+    // 1. Exchange Code for Token
     const tokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         client_id: process.env.FB_APP_ID,
         client_secret: process.env.FB_APP_SECRET,
-        redirect_uri: process.env.FB_REDIRECT_URI,
+        redirect_uri: redirectUri,
         code: code
       }
     });
-    const shortToken = tokenRes.data.access_token;
+    const userAccessToken = tokenRes.data.access_token;
 
-    // 4. Exchange Short Token for Long-Lived User Token (60 days)
+    // 2. Get User Profile (Email & ID)
+    const profileRes = await axios.get(`https://graph.facebook.com/v18.0/me?fields=id,name,email`, {
+      params: { access_token: userAccessToken }
+    });
+    const { id: fbUserId, name, email } = profileRes.data;
+
+    // 3. Find or Create Tenant
+    // Note: In a real app, handle cases where email exists but was signed up via password (merge accounts).
+    let tenant;
+    const userCheck = await pool.query(`SELECT * FROM tenants WHERE email = $1`, [email]);
+
+    if (userCheck.rows.length > 0) {
+      tenant = userCheck.rows[0];
+      console.log(`Existing user logged in: ${email}`);
+    } else {
+      // Create new tenant
+      const newTenant = await pool.query(
+        `INSERT INTO tenants (email, password_hash, company_name) VALUES ($1, 'fb_oauth', $2) RETURNING *`,
+        [email, name]
+      );
+      tenant = newTenant.rows[0];
+      console.log(`New user created: ${email}`);
+    }
+
+    // 4. AUTOMATICALLY Save Page Tokens (Since we have the permission!)
+    // Exchange for Long-Lived Token first
     const longTokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         grant_type: 'fb_exchange_token',
         client_id: process.env.FB_APP_ID,
         client_secret: process.env.FB_APP_SECRET,
-        fb_exchange_token: shortToken
+        fb_exchange_token: userAccessToken
       }
     });
     const longToken = longTokenRes.data.access_token;
 
-    // 5. Get User's Pages
+    // Fetch Accounts
     const pagesRes = await axios.get(`https://graph.facebook.com/v18.0/me/accounts`, {
       params: { access_token: longToken }
     });
 
-    const pages = pagesRes.data.data;
-
-    // 6. Save Tokens to DB
-    for (const page of pages) {
+    // Save Pages
+    for (const page of pagesRes.data.data) {
       const { iv, encryptedData } = encrypt(page.access_token);
-
       await pool.query(`
                 INSERT INTO credentials (tenant_id, platform, page_id, encrypted_token, encryption_iv)
                 VALUES ($1, 'facebook', $2, $3, $4)
                 ON CONFLICT (tenant_id, platform) 
                 DO UPDATE SET encrypted_token = $3, encryption_iv = $4
-            `, [tenant_id, page.id, encryptedData, iv]);
+            `, [tenant.id, page.id, encryptedData, iv]);
 
-      // Subscribe App to Webhooks
+      // Subscribe Webhook
       try {
         await axios.post(`https://graph.facebook.com/${page.id}/subscribed_apps`, {}, {
-          params: {
-            access_token: page.access_token,
-            subscribed_fields: 'messages'
-          }
+          params: { access_token: page.access_token, subscribed_fields: 'messages' }
         });
-      } catch (subErr) {
-        console.error(`Failed to subscribe page ${page.id}:`, subErr.message);
-      }
+      } catch (e) { console.error("Webhook sub failed", e.message); }
     }
 
-    // 7. FINAL SUCCESS REDIRECT
-    // Redirect the user back to your Frontend Dashboard
-    res.redirect('https://site.investorhints.com/dashboard?fb_status=success');
+    // 5. Generate JWT Session
+    const token = jwt.sign({ id: tenant.id }, process.env.JWT_SECRET);
+
+    // 6. Redirect to Frontend with Token
+    // We pass the token in the URL params so the frontend can grab it.
+    res.redirect(`https://site.investorhints.com/auth-callback?token=${token}&tenant_id=${tenant.id}`);
 
   } catch (err) {
-    console.error("OAuth Error:", err.response?.data || err.message);
-    // Redirect to Frontend with error
-    res.redirect('https://site.investorhints.com/dashboard?fb_status=error');
+    console.error("Login Error:", err.message);
+    res.redirect(`https://site.investorhints.com?error=login_failed`);
   }
 });
 
