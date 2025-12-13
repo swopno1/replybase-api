@@ -53,21 +53,44 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // ==========================================
-// 2. FACEBOOK OAUTH (The Magic Link)
+// 2. FACEBOOK OAUTH (Fixed for Browser Redirect)
 // ==========================================
 
-// Step A: Generate the Login URL for the Frontend
+// Step A: Generate the Login URL (Now includes 'state' for tenant_id)
+// Call this from Frontend: GET /auth/facebook/url?tenant_id=UUID
 app.get('/auth/facebook/url', (req, res) => {
-  const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.FB_APP_ID}&redirect_uri=${process.env.FB_REDIRECT_URI}&scope=pages_messaging,pages_show_list,pages_manage_metadata,pages_read_engagement`;
+  const tenantId = req.query.tenant_id;
+
+  if (!tenantId) {
+    return res.status(400).json({ error: "Missing tenant_id" });
+  }
+
+  // We pass tenantId in the 'state' parameter. 
+  // Facebook returns this to us exactly as is.
+  const state = JSON.stringify({ tenant_id: tenantId });
+
+  const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.FB_APP_ID}&redirect_uri=${process.env.FB_REDIRECT_URI}&state=${state}&scope=pages_messaging,pages_show_list,pages_manage_metadata,pages_read_engagement`;
+
   res.json({ url });
 });
 
-// Step B: Handle the Callback -> Exchange Code for Token -> Save to DB
-app.post('/auth/facebook/callback', async (req, res) => {
-  const { code, tenant_id } = req.body; // Frontend sends the code + current user ID
+// Step B: Handle the Callback (Changed from POST to GET)
+app.get('/auth/facebook/callback', async (req, res) => {
+  // 1. Extract Data from Query Params (Browser Redirect)
+  const { code, state } = req.query;
+
+  if (!code || !state) {
+    return res.status(400).send("Login failed: Missing code or state from Facebook.");
+  }
 
   try {
-    // 1. Exchange Code for Short-Lived User Token
+    // 2. Decode the 'state' to get the Tenant ID
+    const stateData = JSON.parse(state);
+    const tenant_id = stateData.tenant_id;
+
+    console.log(`Processing Facebook Connect for Tenant: ${tenant_id}`);
+
+    // 3. Exchange Code for Short-Lived User Token
     const tokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         client_id: process.env.FB_APP_ID,
@@ -78,7 +101,7 @@ app.post('/auth/facebook/callback', async (req, res) => {
     });
     const shortToken = tokenRes.data.access_token;
 
-    // 2. Exchange Short Token for Long-Lived User Token (60 days)
+    // 4. Exchange Short Token for Long-Lived User Token (60 days)
     const longTokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         grant_type: 'fb_exchange_token',
@@ -89,18 +112,17 @@ app.post('/auth/facebook/callback', async (req, res) => {
     });
     const longToken = longTokenRes.data.access_token;
 
-    // 3. Get User's Pages
+    // 5. Get User's Pages
     const pagesRes = await axios.get(`https://graph.facebook.com/v18.0/me/accounts`, {
       params: { access_token: longToken }
     });
 
-    const pages = pagesRes.data.data; // List of pages user manages
+    const pages = pagesRes.data.data;
 
-    // 4. Save Each Page's Token to DB (Encrypted)
+    // 6. Save Tokens to DB
     for (const page of pages) {
       const { iv, encryptedData } = encrypt(page.access_token);
 
-      // Upsert: Update if exists, Insert if new
       await pool.query(`
                 INSERT INTO credentials (tenant_id, platform, page_id, encrypted_token, encryption_iv)
                 VALUES ($1, 'facebook', $2, $3, $4)
@@ -108,20 +130,27 @@ app.post('/auth/facebook/callback', async (req, res) => {
                 DO UPDATE SET encrypted_token = $3, encryption_iv = $4
             `, [tenant_id, page.id, encryptedData, iv]);
 
-      // Also Subscribe App to the Page's Webhooks automatically
-      await axios.post(`https://graph.facebook.com/${page.id}/subscribed_apps`, {}, {
-        params: {
-          access_token: page.access_token,
-          subscribed_fields: 'messages'
-        }
-      });
+      // Subscribe App to Webhooks
+      try {
+        await axios.post(`https://graph.facebook.com/${page.id}/subscribed_apps`, {}, {
+          params: {
+            access_token: page.access_token,
+            subscribed_fields: 'messages'
+          }
+        });
+      } catch (subErr) {
+        console.error(`Failed to subscribe page ${page.id}:`, subErr.message);
+      }
     }
 
-    res.json({ success: true, connected_pages: pages.length });
+    // 7. FINAL SUCCESS REDIRECT
+    // Redirect the user back to your Frontend Dashboard
+    res.redirect('https://site.investorhints.com/dashboard?fb_status=success');
 
   } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({ error: "OAuth Failed" });
+    console.error("OAuth Error:", err.response?.data || err.message);
+    // Redirect to Frontend with error
+    res.redirect('https://site.investorhints.com/dashboard?fb_status=error');
   }
 });
 
