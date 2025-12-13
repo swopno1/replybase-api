@@ -55,12 +55,15 @@ app.post('/auth/login', async (req, res) => {
 
 
 // ==========================================
-// 2. UNIFIED FACEBOOK LOGIN & CONNECT
+// 2. SOCIAL AUTH (Facebook & Google)
 // ==========================================
 
-// A. Initiate Login (Front-end links here)
+// ------------------------------------------
+// FACEBOOK LOGIN (New User / Sign In)
+// ------------------------------------------
+
 app.get('/auth/facebook/login', (req, res) => {
-  // We ask for email AND page permissions immediately
+  // We ask for email AND page permissions immediately (for a seamless "sign up with FB")
   const scopes = 'email,public_profile,pages_messaging,pages_show_list,pages_manage_metadata,pages_read_engagement';
   const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/facebook/callback_login`;
 
@@ -68,15 +71,14 @@ app.get('/auth/facebook/login', (req, res) => {
   res.json({ url });
 });
 
-// B. Handle Login Callback
 app.get('/auth/facebook/callback_login', async (req, res) => {
   const { code } = req.query;
   const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/facebook/callback_login`;
 
-  if (!code) return res.status(400).send("No code received from Facebook");
+  if (!code) return res.status(400).send("No code received");
 
   try {
-    // 1. Exchange Code for Token
+    // 1. Exchange Code
     const tokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
       params: {
         client_id: process.env.FB_APP_ID,
@@ -87,75 +89,187 @@ app.get('/auth/facebook/callback_login', async (req, res) => {
     });
     const userAccessToken = tokenRes.data.access_token;
 
-    // 2. Get User Profile (Email & ID)
+    // 2. Get Profile
     const profileRes = await axios.get(`https://graph.facebook.com/v18.0/me?fields=id,name,email`, {
       params: { access_token: userAccessToken }
     });
     const { id: fbUserId, name, email } = profileRes.data;
 
+    // CHECK: If email is missing, we cannot create an account (User might have signed up with Phone # or declined permission)
+    if (!email) {
+      console.warn(`Login failed: No email for FB User ${name} (${fbUserId})`);
+      return res.redirect(`https://site.investorhints.com/login?error=missing_email`);
+    }
+
     // 3. Find or Create Tenant
-    // Note: In a real app, handle cases where email exists but was signed up via password (merge accounts).
     let tenant;
     const userCheck = await pool.query(`SELECT * FROM tenants WHERE email = $1`, [email]);
 
     if (userCheck.rows.length > 0) {
       tenant = userCheck.rows[0];
-      console.log(`Existing user logged in: ${email}`);
     } else {
-      // Create new tenant
       const newTenant = await pool.query(
         `INSERT INTO tenants (email, password_hash, company_name) VALUES ($1, 'fb_oauth', $2) RETURNING *`,
         [email, name]
       );
       tenant = newTenant.rows[0];
-      console.log(`New user created: ${email}`);
     }
 
-    // 4. AUTOMATICALLY Save Page Tokens (Since we have the permission!)
-    // Exchange for Long-Lived Token first
-    const longTokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
-      params: {
-        grant_type: 'fb_exchange_token',
-        client_id: process.env.FB_APP_ID,
-        client_secret: process.env.FB_APP_SECRET,
-        fb_exchange_token: userAccessToken
-      }
-    });
-    const longToken = longTokenRes.data.access_token;
+    // 4. Update/Link Pages (Auto-magically)
+    await linkFacebookPages(tenant.id, userAccessToken);
 
-    // Fetch Accounts
-    const pagesRes = await axios.get(`https://graph.facebook.com/v18.0/me/accounts`, {
-      params: { access_token: longToken }
-    });
-
-    // Save Pages
-    for (const page of pagesRes.data.data) {
-      const { iv, encryptedData } = encrypt(page.access_token);
-      await pool.query(`
-                INSERT INTO credentials (tenant_id, platform, page_id, encrypted_token, encryption_iv)
-                VALUES ($1, 'facebook', $2, $3, $4)
-                ON CONFLICT (tenant_id, platform) 
-                DO UPDATE SET encrypted_token = $3, encryption_iv = $4
-            `, [tenant.id, page.id, encryptedData, iv]);
-
-      // Subscribe Webhook
-      try {
-        await axios.post(`https://graph.facebook.com/${page.id}/subscribed_apps`, {}, {
-          params: { access_token: page.access_token, subscribed_fields: 'messages' }
-        });
-      } catch (e) { console.error("Webhook sub failed", e.message); }
-    }
-
-    // 5. Generate JWT Session
+    // 5. Session
     const token = jwt.sign({ id: tenant.id }, process.env.JWT_SECRET);
-
-    // 6. Redirect to Frontend with Token
-    // We pass the token in the URL params so the frontend can grab it.
     res.redirect(`https://site.investorhints.com/auth-callback?token=${token}&tenant_id=${tenant.id}`);
 
   } catch (err) {
-    console.error("Login Error:", err.message);
+    console.error("FB Login Error:", err.message);
     res.redirect(`https://site.investorhints.com?error=login_failed`);
+  }
+});
+
+
+// ------------------------------------------
+// FACEBOOK CONNECT (Link Pages to Existing User)
+// ------------------------------------------
+
+// Protected: User must be logged in to ask for the Connect URL
+app.get('/auth/facebook/connect', authenticate, (req, res) => {
+  const scopes = 'pages_messaging,pages_show_list,pages_manage_metadata,pages_read_engagement'; // No email needed if just connecting pages
+  const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/facebook/callback_connect`;
+
+  // We pass tenant_id in 'state' so we know who to link to in the callback
+  // In production, sign this state to prevent tampering!
+  const state = req.user.id;
+
+  const url = `https://www.facebook.com/v18.0/dialog/oauth?client_id=${process.env.FB_APP_ID}&redirect_uri=${redirectUri}&scope=${scopes}&state=${state}`;
+  res.json({ url });
+});
+
+app.get('/auth/facebook/callback_connect', async (req, res) => {
+  const { code, state } = req.query; // state is the tenant_id
+  const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/facebook/callback_connect`;
+
+  if (!code || !state) return res.redirect(`https://site.investorhints.com/dashboard?error=connect_failed`);
+
+  try {
+    // 1. Exchange Code
+    const tokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
+      params: {
+        client_id: process.env.FB_APP_ID,
+        client_secret: process.env.FB_APP_SECRET,
+        redirect_uri: redirectUri,
+        code: code
+      }
+    });
+    const userAccessToken = tokenRes.data.access_token;
+
+    // 2. Link Pages
+    await linkFacebookPages(state, userAccessToken);
+
+    // 3. Back to Dashboard
+    res.redirect(`https://site.investorhints.com/dashboard?success=facebook_connected`);
+
+  } catch (err) {
+    console.error("FB Connect Error:", err.message);
+    res.redirect(`https://site.investorhints.com/dashboard?error=connect_failed`);
+  }
+});
+
+// Helper: Shared Logic to Link Pages
+async function linkFacebookPages(tenantId, shortLivedToken) {
+  // Exchange for Long-Lived
+  const longTokenRes = await axios.get(`https://graph.facebook.com/v18.0/oauth/access_token`, {
+    params: {
+      grant_type: 'fb_exchange_token',
+      client_id: process.env.FB_APP_ID,
+      client_secret: process.env.FB_APP_SECRET,
+      fb_exchange_token: shortLivedToken
+    }
+  });
+  const longToken = longTokenRes.data.access_token;
+
+  // Fetch Accounts
+  const pagesRes = await axios.get(`https://graph.facebook.com/v18.0/me/accounts`, {
+    params: { access_token: longToken }
+  });
+
+  // Save Pages
+  for (const page of pagesRes.data.data) {
+    const { iv, encryptedData } = encrypt(page.access_token);
+    await pool.query(`
+              INSERT INTO credentials (tenant_id, platform, page_id, encrypted_token, encryption_iv)
+              VALUES ($1, 'facebook', $2, $3, $4)
+              ON CONFLICT (tenant_id, platform) 
+              DO UPDATE SET encrypted_token = $3, encryption_iv = $4
+          `, [tenantId, page.id, encryptedData, iv]);
+
+    try {
+      await axios.post(`https://graph.facebook.com/${page.id}/subscribed_apps`, {}, {
+        params: { access_token: page.access_token, subscribed_fields: 'messages' }
+      });
+    } catch (e) { console.error("Webhook sub failed", e.message); }
+  }
+}
+
+
+// ------------------------------------------
+// GOOGLE LOGIN (New)
+// ------------------------------------------
+
+app.get('/auth/google', (req, res) => {
+  const scopes = 'https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email';
+  const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/google/callback`;
+
+  const url = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${process.env.GOOGLE_CLIENT_ID}&redirect_uri=${redirectUri}&response_type=code&scope=${scopes}&access_type=offline`;
+  res.json({ url });
+});
+
+app.get('/auth/google/callback', async (req, res) => {
+  const { code } = req.query;
+  const redirectUri = `${process.env.API_BASE_URL || 'https://api.investorhints.com'}/auth/google/callback`;
+
+  if (!code) return res.status(400).send("No code from Google");
+
+  try {
+    // 1. Exchange Code for Token
+    const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code'
+    });
+
+    const { access_token } = tokenRes.data;
+
+    // 2. Get Profile
+    const profileRes = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+    const { email, name } = profileRes.data;
+
+    // 3. Upsert User
+    let tenant;
+    const userCheck = await pool.query(`SELECT * FROM tenants WHERE email = $1`, [email]);
+
+    if (userCheck.rows.length > 0) {
+      tenant = userCheck.rows[0];
+    } else {
+      const newTenant = await pool.query(
+        `INSERT INTO tenants (email, password_hash, company_name) VALUES ($1, 'google_oauth', $2) RETURNING *`,
+        [email, name]
+      );
+      tenant = newTenant.rows[0];
+    }
+
+    // 4. Session
+    const token = jwt.sign({ id: tenant.id }, process.env.JWT_SECRET);
+    res.redirect(`https://site.investorhints.com/auth-callback?token=${token}&tenant_id=${tenant.id}`);
+
+  } catch (err) {
+    console.error("Google Login Error:", err.message);
+    res.redirect(`https://site.investorhints.com?error=google_login_failed`);
   }
 });
 
