@@ -250,6 +250,57 @@ app.post("/webhooks/meta", async (req, res) => {
   }
 });
 
+// ==========================================
+// 4. PRIVATE DASHBOARD API (New)
+// ==========================================
+
+// Middleware to check JWT (Protect routes)
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+      if (err) return res.sendStatus(403);
+      req.user = user;
+      next();
+    });
+  } else {
+    res.sendStatus(401);
+  }
+};
+
+// GET /tenant/status - Returns connected platforms
+app.get('/tenant/status', authenticate, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT platform, page_id, created_at FROM credentials WHERE tenant_id = $1`,
+      [req.user.id]
+    );
+    res.json({ connections: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: "Db error" });
+  }
+});
+
+// POST /tenant/whatsapp - Manual WhatsApp Connection
+app.post('/tenant/whatsapp', authenticate, async (req, res) => {
+  const { phone_id, access_token } = req.body;
+  // For WhatsApp, we often paste the Permanent Token manually in MVP
+  const { iv, encryptedData } = encrypt(access_token);
+
+  try {
+    await pool.query(`
+            INSERT INTO credentials (tenant_id, platform, page_id, encrypted_token, encryption_iv)
+            VALUES ($1, 'whatsapp', $2, $3, $4)
+            ON CONFLICT (tenant_id, platform) 
+            DO UPDATE SET encrypted_token = $3, encryption_iv = $4
+        `, [req.user.id, phone_id, encryptedData, iv]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to save WhatsApp creds" });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Wrapper API running on port ${PORT}`));
 
