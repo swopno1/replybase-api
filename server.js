@@ -1,4 +1,16 @@
 require('dotenv').config();
+
+// Crash logging
+process.on('uncaughtException', err => {
+  console.error('There was an uncaught error', err)
+  process.exit(1) //mandatory (as per the Node.js docs)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason)
+  // Recommended: send the information to sentry.io or similar
+})
+
 const express = require('express');
 const { Pool } = require('pg');
 const axios = require('axios');
@@ -175,6 +187,21 @@ app.get('/auth/facebook/callback_connect', async (req, res) => {
     res.redirect(`https://site.investorhints.com/dashboard?error=connect_failed`);
   }
 });
+
+// Middleware to check JWT (Protect routes)
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+      if (err) return res.sendStatus(403);
+      req.user = user;
+      next();
+    });
+  } else {
+    res.sendStatus(401);
+  }
+};
 
 // Helper: Shared Logic to Link Pages
 async function linkFacebookPages(tenantId, shortLivedToken) {
@@ -373,21 +400,6 @@ app.post("/webhooks/meta", async (req, res) => {
 // 4. PRIVATE DASHBOARD API (New)
 // ==========================================
 
-// Middleware to check JWT (Protect routes)
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    const token = authHeader.split(' ')[1];
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-      if (err) return res.sendStatus(403);
-      req.user = user;
-      next();
-    });
-  } else {
-    res.sendStatus(401);
-  }
-};
-
 // GET /tenant/status - Returns connected platforms
 app.get('/tenant/status', authenticate, async (req, res) => {
   try {
@@ -478,6 +490,22 @@ app.post('/auth/facebook/delete-data', async (req, res) => {
   }
 
   res.sendStatus(400);
+});
+
+
+// ==========================================
+// 6. HEALTH & STATUS
+// ==========================================
+
+app.get('/health', async (req, res) => {
+  try {
+    // Check DB connection
+    await pool.query('SELECT NOW()');
+    res.status(200).json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    console.error('Health check failed:', err);
+    res.status(500).json({ status: 'error', database: 'disconnected' });
+  }
 });
 
 
