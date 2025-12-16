@@ -1,4 +1,16 @@
 require('dotenv').config();
+
+// Crash logging
+process.on('uncaughtException', err => {
+  console.error('There was an uncaught error', err)
+  process.exit(1) //mandatory (as per the Node.js docs)
+})
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason)
+  // Recommended: send the information to sentry.io or similar
+})
+
 const express = require('express');
 const { Pool } = require('pg');
 const axios = require('axios');
@@ -478,6 +490,22 @@ app.post('/auth/facebook/delete-data', async (req, res) => {
   }
 
   res.sendStatus(400);
+});
+
+
+// ==========================================
+// 6. HEALTH & STATUS
+// ==========================================
+
+app.get('/health', async (req, res) => {
+  try {
+    // Check DB connection
+    await pool.query('SELECT NOW()');
+    res.status(200).json({ status: 'ok', database: 'connected' });
+  } catch (err) {
+    console.error('Health check failed:', err);
+    res.status(500).json({ status: 'error', database: 'disconnected' });
+  }
 });
 
 
