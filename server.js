@@ -132,14 +132,13 @@ app.get("/auth/facebook/callback_login", async (req, res) => {
         params: { access_token: userAccessToken },
       }
     );
-    const { id: fbUserId, name, email } = profileRes.data;
+    const { id: fbUserId, name } = profileRes.data;
+    let email = profileRes.data.email;
 
-    // CHECK: If email is missing, we cannot create an account (User might have signed up with Phone # or declined permission)
+    // If email is missing, create a synthetic one using FB User ID
     if (!email) {
-      console.warn(`Login failed: No email for FB User ${name} (${fbUserId})`);
-      return res.redirect(
-        `https://site.investorhints.com/login?error=missing_email`
-      );
+      console.log(`No email for FB User ${name} (${fbUserId}). Creating account with FB ID.`);
+      email = `${fbUserId}@facebook.user.com`;
     }
 
     // 3. Find or Create Tenant
@@ -292,7 +291,7 @@ async function linkFacebookPages(tenantId, shortLivedToken) {
 // GOOGLE LOGIN (New)
 // ------------------------------------------
 
-app.get("/auth/google", (req, res) => {
+app.get("/auth/google/login", (req, res) => {
   const scopes =
     "https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email";
   const redirectUri = `${
