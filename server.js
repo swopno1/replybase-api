@@ -24,6 +24,21 @@ app.use(express.json());
 const cors = require("cors");
 app.use(cors());
 
+// Middleware to check JWT (Protect routes)
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (authHeader) {
+    const token = authHeader.split(" ")[1];
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+      if (err) return res.sendStatus(403);
+      req.user = user;
+      next();
+    });
+  } else {
+    res.sendStatus(401);
+  }
+};
+
 // Database Connection
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -218,21 +233,6 @@ app.get("/auth/facebook/callback_connect", async (req, res) => {
     );
   }
 });
-
-// Middleware to check JWT (Protect routes)
-const authenticate = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader) {
-    const token = authHeader.split(" ")[1];
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-      if (err) return res.sendStatus(403);
-      req.user = user;
-      next();
-    });
-  } else {
-    res.sendStatus(401);
-  }
-};
 
 // Helper: Shared Logic to Link Pages
 async function linkFacebookPages(tenantId, shortLivedToken) {
